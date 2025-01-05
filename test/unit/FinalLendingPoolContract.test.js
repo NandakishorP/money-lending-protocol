@@ -178,6 +178,14 @@ describe("FinalLendingPoolContract", function () {
         expect(finalLpTokenBalance).to.equal(initialLpTokenBalance.sub(lpBurnAmount1 + lpBurnAmount2));
     });
     //it tests the function to make collateral deposit to borrow funds
+    //testing by passing zero deposit amount
+    it("should revert when the deposit amount is zero", async () => {
+        const depositValue = ethers.utils.parseEther("0")
+        await expect(
+            lendingPoolContract.connect(deployer).depositCollateral({ value: depositValue }))
+            .to.be.revertedWith("FinalLendingPoolContract__NotEnoughAmount")
+    })
+
     it("allows users to deposit collateral to take loans", async () => {
         const depositValue = await ethers.utils.parseEther("5");
         const initalTotalCollateral = await lendingPoolContract.totalCollateral();

@@ -1,0 +1,59 @@
+/* Navbar container */
+.navbar {
+    background-color: white;
+    padding: 1rem 2rem;
+    box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+  }
+  
+  /* Flex container */
+  .container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  
+  /* Brand title */
+  .brand-title {
+    font-size: 1.5rem;
+    font-weight: bold;
+    color: black;
+  }
+  
+  /* Navigation links */
+  .nav-links {
+    display: flex;
+    gap: 20px;
+  }
+  
+  .nav-link {
+    text-decoration: none;
+    color: #333;
+    font-size: 1rem;
+    transition: color 0.3s;
+  }
+  
+  .nav-link:hover {
+    color: #007bff;
+  }
+  
+  /* Right section (Connect Button + Message) */
+  .right-section {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+  }
+  
+  .connect-message {
+    color: gray;
+    font-size: 0.9rem;
+    display: none; /* Hidden on small screens */
+  }
+  
+  /* Responsive Styles */
+  @media (min-width: 768px) {
+    .connect-message {
+      display: block;
+    }
+  }

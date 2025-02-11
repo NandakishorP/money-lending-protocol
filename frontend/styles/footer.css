@@ -1,0 +1,28 @@
+/* Footer */
+.footer {
+    background: #222;
+    color: white;
+    padding: 1rem 2rem;
+    text-align: center;
+  }
+  
+  /* Footer Container */
+  .footer-container {
+    max-width: 1200px;
+    margin: auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  
+  /* Links */
+  .footer-links a {
+    color: white;
+    margin-left: 15px;
+    text-decoration: none;
+    transition: color 0.3s;
+  }
+  
+  .footer-links a:hover {
+    color: #007bff;
+  }

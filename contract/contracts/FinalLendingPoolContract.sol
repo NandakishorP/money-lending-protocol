@@ -2,6 +2,7 @@
 pragma solidity ^0.8.7;
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "../contracts/LPToken.sol";
 
@@ -55,8 +56,15 @@ error FinalLendingPoolContract__InsufficientLPTokens();
  * @notice Error thrown when the withdrawal transaction fails due to insufficient deposit amount.
  */
 error FinalLendingPoolContract__InsufficientEtherBalance();
+/**
+ * @notice Error thrown when the user tries to take another loan when there is a pending loan.
+ */
+error FinalLendingPoolContract__LoanAlreadyActive();
 
-contract FinalLendingPoolContract is ReentrancyGuard {
+contract FinalLendingPoolContract is
+  ReentrancyGuard,
+  AutomationCompatibleInterface
+{
   /**
    * @notice Minimum collateral-to-loan ratio to avoid liquidation.
    * @custom:value 60
@@ -73,7 +81,6 @@ contract FinalLendingPoolContract is ReentrancyGuard {
 
   /**
    * @notice The USDT token contract interface.
-   * @dev Allows interaction with the USDT token for transferring between users.
    */
   IERC20 public usdtToken;
 
@@ -85,41 +92,53 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   struct LoanDetails {
     /**
      * @notice The amount of USDT borrowed in the loan.
-     * @dev Denominated in USDT, this is the total borrowed amount.
      */
     uint256 amountBorrowedInUSDT;
     /**
      * @notice The amount of collateral provided for the loan.
-     * @dev Denominated in the asset's smallest unit, it secures the loan.
      */
     uint256 collateralUsed;
     /**
      * @notice Timestamp of the last update made to the loan.
-     * @dev Tracks time-sensitive changes such as loan repayments or collateral updates.
      */
     uint256 lastUpdate;
+    /**
+     * @notice Timestamp of the due date of the loan.
+     */
+    uint256 dueDate;
+    /**
+     * @notice The number of times the loan has been extended.
+     */
+    uint8 penaltyCount;
+    /**
+     * @notice The status of the loan.
+     */
+    bool isLiquidated;
   }
+  /**
+   * @notice The list of borrowers who have taken loans from the pool.
+   * @dev This array stores the addresses of all borrowers who have active loans in the pool.
+   */
+  address[] public borrowers;
+  /**
+   * @notice The list of borrowers who have taken loans from the pool.
+   */
+  mapping(address => bool) private hasBorrowed;
   // Mappings
-
   /**
    * @notice Tracks the total deposit amount for each user.
-   * @dev Maps a user's address to the total amount they have deposited into the pool, denominated in Ether.
    */
   mapping(address => uint256) private depositAmount;
-
   /**
    * @notice Tracks the available collateral amount provided by the user.
-   * @dev Maps a user's address to the total amount of collateral they currently have for borrowing, denominated in Ether.
    */
   mapping(address => uint256) private availableCollateralAmount;
-
   /**
    * @notice Tracks the amount of collateral currently used by each borrower.
    * @dev This mapping keeps track of the portion of a user's collateral that is locked for loan purposes.
    *      The remaining collateral is reflected in the user's available collateral balance.
    */
   mapping(address => uint256) private usedCollateralAmount;
-
   /**
    * @notice Tracks the loan details for each user.
    * @dev Maps a user's address to the `LoanDetails` struct, which contains:
@@ -128,28 +147,21 @@ contract FinalLendingPoolContract is ReentrancyGuard {
    *      Both values are denominated in Ether.
    */
   mapping(address => LoanDetails) private loanCredentials;
-
   /**
    * @notice Tracks the LPToken balance of each user.
-   * @dev This mapping keeps track of the LPToken that each user has earned by depositing funds into the protocol.
    */
   mapping(address => uint256) public lpTokenQuantity;
-
   //   state variables
   /**
    * @notice The total amount of liquidity available in the lending pool.
-   * @dev Represents the sum of all deposits made by users into the pool, denominated in Ether.
    */
   uint256 public totalLiquidity;
-
   /**
    * @notice The total amount of collateral provided by all users.
-   * @dev Represents the cumulative value of all collateral locked in the pool, denominated in Ether.
    */
   uint256 public totalCollateral;
   /**
    * @notice The total amount of lona take by all  users
-   * @dev Represents the sum of all the loans taken by the user from the pool,denominated in Ether
    */
   uint256 public totalBorrowed;
   /**
@@ -160,13 +172,24 @@ contract FinalLendingPoolContract is ReentrancyGuard {
 
   /**
    * @notice Represents the maximum interest rate that can be applied to loans.
-   * @dev This rate sets an upper limit on the interest rate that can be applied to loans. It prevents interest rates from exceeding this threshold, regardless of other factors.
    */
   uint256 public maxInterestRate;
+  /**
+   * @notice Time extensions available for certain operations.
+   * @dev These constants define the duration of the first and second extension periods.
+   */
+  uint256 public constant FIRST_EXTENSION_TIME = 3 days; // First extension period.
+  uint256 public constant SECOND_EXTENSION_TIME = 2 days; // Second extension period.
+
+  /**
+   * @notice Penalty rates applied under specific conditions.
+   * @dev These constants represent the percentage penalties for different cases.
+   */
+  uint256 public constant FIRST_PENALTY_RATE = 5;
+  uint256 public constant SECOND_PENALTY_RATE = 10;
 
   /**
    * @notice LP token contract instance used for minting and burning tokens
-   * @dev This variable stores the address of the LPToken contract and provides access to its methods
    */
   LPToken public lpToken;
   //   Immutable variables
@@ -176,11 +199,16 @@ contract FinalLendingPoolContract is ReentrancyGuard {
    *      for a specific asset(usdt here). This variable is immutable and set during contract deployment.
    */
   AggregatorV3Interface public immutable PRICE_FEED;
+  // Precision constant for calculations
+  uint256 constant PRECISION = 1e18;
+  uint256 constant SECONDS_IN_YEAR = 365 * 24 * 60 * 60;
+
   /**
-   * @notice Initializes the contract with the required external dependencies.
-   * @dev Sets up the price feed and USDT token contracts by storing their addresses.
-   * @param _priceFeedAddress The address of the Chainlink price feed contract for fetching asset prices.
-   * @param _usdtAddress The address of the USDT token contract used for lending and borrowing operations.
+   * @notice Initializes the contract with external dependencies for price feeds, USDT, and LP tokens.
+   * @dev Sets up core integrations required for lending and borrowing.
+   * @param _priceFeedAddress Chainlink price feed contract address.
+   * @param _usdtAddress USDT token contract address.
+   * @param _lpTokenAddress LP token contract address.
    */
   constructor(
     address _priceFeedAddress,
@@ -269,6 +297,8 @@ contract FinalLendingPoolContract is ReentrancyGuard {
     uint256 withdrawAmount,
     uint256 balanceCollateral
   );
+  event LoanExtended(address borrower, uint256 newDueDate, uint256 penalty);
+
   //functions
   /**
    * @notice Allows users to deposit Ether into the lending pool and receive LP tokens in return.
@@ -346,6 +376,9 @@ contract FinalLendingPoolContract is ReentrancyGuard {
     if (amount <= 0) {
       revert FinalLendingPoolContract__InvalidLoanAmount();
     }
+    if (loanCredentials[msg.sender].amountBorrowedInUSDT > 0) {
+      revert FinalLendingPoolContract__LoanAlreadyActive();
+    }
 
     uint256 collateralAvailable = availableCollateralAmount[msg.sender];
 
@@ -376,9 +409,14 @@ contract FinalLendingPoolContract is ReentrancyGuard {
       loanCredentials[msg.sender].amountBorrowedInUSDT = amount;
       loanCredentials[msg.sender].collateralUsed = allowedLoanAmount;
       loanCredentials[msg.sender].lastUpdate = block.timestamp;
-
+      loanCredentials[msg.sender].dueDate = block.timestamp + 90 days;
+      if (!hasBorrowed[msg.sender]) {
+        borrowers.push(msg.sender);
+        hasBorrowed[msg.sender] = true;
+      }
       usdtToken.transfer(msg.sender, amount);
     }
+
     emit LoanBorrowed(msg.sender, amount, allowedLoanAmount);
   }
 
@@ -447,6 +485,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
 
     return usdtInETH;
   }
+
   /**
    * @notice Allows a user to repay a portion or the full amount of their borrowed loan.
    * @dev The function is protected with `nonReentrant` to prevent reentrancy attacks.
@@ -464,6 +503,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
    * - `RepayLoan` with the borrower's address, the repayment amount, and the remaining loan balance.
    */
   // Function to allow users to repay a loan with a specified amount.
+
   function repayLoan(uint256 amount) external nonReentrant {
     if (amount <= 0) {
       revert FinalLendingPoolContract__NotEnoughAmount(); // Custom error thrown if repayment is zero or negative.
@@ -478,14 +518,15 @@ contract FinalLendingPoolContract is ReentrancyGuard {
       revert FinalLendingPoolContract__LoanRepayLimitExceeded();
     }
 
-    loan.amountBorrowedInUSDT = totalDueAmount - amount;
-
     usdtToken.transferFrom(msg.sender, address(this), amount);
+    loan.amountBorrowedInUSDT = totalDueAmount - amount; // this part will be below the loan transaction because if its above the transfer from function then the risk of transfer is on the contract not on the user
 
     loan.lastUpdate = block.timestamp;
 
     emit RepayLoan(msg.sender, amount, loan.amountBorrowedInUSDT);
   }
+
+  // chainlink keepers
 
   /**
    * @notice Liquidates a borrower's loan if their collateral falls below the required threshold.
@@ -508,7 +549,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
    *                 loan amount in USDT, and collateral value in USDT.
    */
 
-  function liquidate(address borrower) external nonReentrant {
+  function liquidate(address borrower) internal nonReentrant {
     // Retrieve the borrower's loan and collateral details
     LoanDetails storage loan = loanCredentials[borrower];
     uint256 loanAmountInUSDT = loan.amountBorrowedInUSDT;
@@ -535,39 +576,53 @@ contract FinalLendingPoolContract is ReentrancyGuard {
 
     emit Liquidated(borrower, loanAmountInUSDT, collateralValueInUSDT);
   }
+
   /**
-   * @notice Calculates the utilization ratio of the lending pool.
-   * @dev This function computes the utilization ratio by dividing the total borrowed amount by the total liquidity available in the pool. The ratio is expressed as a percentage and helps to assess how much of the pool's liquidity is being used for loans.
-   * The function is internal and can only be called within the contract. It does not modify the state of the contract.
-   * @return uint256 The utilization ratio, calculated as `totalBorrowed / totalLiquidity`, expressed as a percentage (scaled).
+   * @notice Returns the lending pool's utilization ratio as a percentage.
+   * @dev Computed as `(totalBorrowed * PRECISION) / totalLiquidity`.
+   *      Returns `0` if there is no liquidity. Internal function.
+   * @return uint256 Utilization ratio, scaled for precision.
    */
   function calculateUtilizationRatio() internal view returns (uint256) {
-    return totalBorrowed / totalLiquidity;
+    if (totalLiquidity == 0) {
+      return 0;
+    }
+    return (totalBorrowed * PRECISION) / totalLiquidity;
   }
+
   /**
-   * @notice Calculates the interest rate based on the current utilization ratio.
-   * @dev This function determines the interest rate by considering the base interest rate and the maximum interest rate. The interest rate is dynamically adjusted based on the utilization ratio, with higher utilization leading to a higher interest rate. The calculation uses the formula:
-   * `interestRate = baseInterestRate + (maxInterestRate - baseInterestRate) * utilization`.
-   * This function is internal and can only be called within the contract.
-   * @return uint256 The calculated interest rate, considering the base and maximum interest rates, adjusted by the utilization ratio.
+   * @notice Computes the dynamic interest rate based on the utilization ratio.
+   * @dev Uses a two-phase model: a linear increase up to the kink point, then a steeper increase.
+   *      Formula:
+   *      - If `utilization < kink`: `interestRate = baseInterestRate + ((maxInterestRate - baseInterestRate) * utilization) / kink`
+   *      - Else: `interestRate = maxInterestRate + ((maxInterestRate * (utilization - kink)) / (PRECISION - kink))`
+   * @return uint256 The adjusted interest rate, scaled for precision.
    */
   function calculateInterestRate() public view returns (uint256) {
     uint256 utilization = calculateUtilizationRatio();
-    //interest rate is determined here using the utiliztion ratio
-    uint256 interestRate = baseInterestRate +
-      (maxInterestRate - baseInterestRate) *
-      utilization;
+    uint256 kink = (4 * PRECISION) / 5;
+
+    uint256 interestRate;
+    if (utilization < kink) {
+      interestRate =
+        baseInterestRate +
+        ((maxInterestRate - baseInterestRate) * utilization) /
+        kink;
+    } else {
+      interestRate =
+        maxInterestRate +
+        ((maxInterestRate * (utilization - kink)) / (PRECISION - kink));
+    }
+
     return interestRate;
   }
+
   /**
-   * @notice Calculates the accrued interest for a given borrower based on the elapsed time.
-   * @dev This function computes the interest accrued on the borrower's loan amount based on the current utilization ratio and interest rate.
-   * The interest is calculated using the formula:
-   * `interest = (loanAmount * interestRate * elapsedTime) / 100 / 365 / 24 / 60 / 60`.
-   * The function considers the loan amount, interest rate, and elapsed time to return the amount of interest accrued in the specified period.
-   * @param borrower The address of the borrower for whom the interest is being calculated.
-   * @param elapsedTime The elapsed time (in seconds) for which the interest is to be calculated.
-   * @return uint256 The total accrued interest for the borrower during the specified elapsed time period.
+   * @notice Calculates the accrued interest on a borrower's loan over a given period.
+   * @dev Uses `interest = (loanAmount * interestRate * elapsedTime) / PRECISION / SECONDS_IN_YEAR`.
+   * @param borrower The borrower's address.
+   * @param elapsedTime Time elapsed (in seconds) for interest calculation.
+   * @return uint256 Accrued interest for the given period, scaled for precision.
    */
   function calculateAccruedInterest(
     address borrower,
@@ -575,14 +630,14 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   ) public view returns (uint256) {
     uint256 loanAmount = loanCredentials[borrower].amountBorrowedInUSDT;
     uint256 interestRate = calculateInterestRate();
+
     uint256 interest = (loanAmount * interestRate * elapsedTime) /
-      100 /
-      365 /
-      24 /
-      60 /
-      60;
+      PRECISION /
+      SECONDS_IN_YEAR;
+
     return interest;
   }
+
   /**
    * @notice Allows users to withdraw a specified Ether amount and burn a specified LP token amount for additional Ether.
    * @dev This function ensures the user has sufficient Ether deposit and LP token balance. It calculates the equivalent Ether
@@ -679,6 +734,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
       availableCollateralAmount[msg.sender]
     );
   }
+
   /**
    * @notice Returns the deposit amount of a specified user.
    * @dev This function allows anyone to query the deposit amount of a specific user. The deposit amount is stored in the contract's state.
@@ -688,6 +744,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   function getDepositAmount(address user) external view returns (uint256) {
     return depositAmount[user];
   }
+
   /**
    * @notice Returns the collateral amount of a specified user.
    * @dev This function allows anyone to query the collateral amount of a specific user. The collateral amount is stored in the contract's state.
@@ -697,6 +754,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   function getCollateralAmount(address user) external view returns (uint256) {
     return availableCollateralAmount[user];
   }
+
   /**
    * @notice Calculates the current value of an LP token in Ether.
    * @dev The value of an LP token is determined by the proportion of the pool's total liquidity
@@ -711,6 +769,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
     }
     return (1 ether * totalLiquidity) / lpTokenSupply;
   }
+
   /**
    * @notice Returns the total debt of a specified user in USDT.
    * @dev Queries the loan amount stored in the `loanCredentials` structure for the given user.
@@ -720,6 +779,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   function getDebt(address user) public view returns (uint256) {
     return loanCredentials[user].amountBorrowedInUSDT;
   }
+
   /**
    * @notice Returns the total collateral used by a specified user, denominated in ETH.
    * @dev Retrieves the `collateralUsed` value stored in the `loanCredentials` structure for the given user.
@@ -729,6 +789,7 @@ contract FinalLendingPoolContract is ReentrancyGuard {
   function getDebtInETH(address user) public view returns (uint256) {
     return loanCredentials[user].collateralUsed;
   }
+
   /**
    * @notice Returns the total loan amount due for a specified user, including accrued interest.
    * @dev Calculates the accrued interest based on the user's borrowed amount, interest rate,
@@ -749,5 +810,69 @@ contract FinalLendingPoolContract is ReentrancyGuard {
 
     uint256 totalDueAmount = loan.amountBorrowedInUSDT + accruedInterest;
     return totalDueAmount;
+  }
+
+  /**
+   * @notice Returns the total collateral locked in the contract for a user.
+   * @dev Retrieves the `usedCollateralAmount` associated with the given borrower.
+   * This represents the collateral utilized for securing a loan.
+   * @param borrower The address of the user whose locked collateral amount is being queried.
+   * @return The total amount of collateral used by the borrower, denominated in USDT.
+   */
+  function getTotalUsedCollateralOfUser(
+    address borrower
+  ) public view returns (uint256) {
+    return usedCollateralAmount[borrower];
+  }
+
+  /**
+   * @notice Determines if upkeep is needed for overdue loans.
+   * @dev Iterates through borrowers and checks if any loan is overdue.
+   *      If an overdue loan exists, it returns `true` with the borrower's address.
+   * @return upkeepNeeded `true` if at least one borrower has an overdue loan.
+   * @return performData Encoded address of the borrower with an overdue loan.
+   */
+  function checkUpkeep(
+    bytes calldata /* checkData */
+  )
+    external
+    view
+    override
+    returns (bool upkeepNeeded, bytes memory performData)
+  {
+    for (uint256 i = 0; i < borrowers.length; i++) {
+      address borrower = borrowers[i];
+      LoanDetails storage loan = loanCredentials[borrower];
+
+      if (block.timestamp > loan.dueDate && loan.amountBorrowedInUSDT > 0) {
+        return (true, abi.encode(borrower));
+      }
+    }
+    return (false, "");
+  }
+
+  /**
+   * @notice Executes upkeep by applying penalties or liquidating overdue loans.
+   * @dev Decodes the borrower's address from `performData` and checks if their loan is overdue.
+   *      If the borrower has missed payments but has fewer than 2 penalties, a 10% penalty is added,
+   *      and the due date is extended by 30 days. Otherwise, the loan is liquidated.
+   * @param performData Encoded borrower's address requiring upkeep.
+   */
+  function performUpkeep(bytes calldata performData) external override {
+    address borrower = abi.decode(performData, (address));
+    LoanDetails storage loan = loanCredentials[borrower];
+
+    if (block.timestamp < loan.dueDate || loan.amountBorrowedInUSDT == 0) {
+      return;
+    }
+
+    if (loan.penaltyCount < 2) {
+      loan.penaltyCount += 1;
+      loan.amountBorrowedInUSDT += loan.amountBorrowedInUSDT / 10;
+      loan.dueDate += 30 days;
+    } else {
+      liquidate(borrower);
+      loan.isLiquidated = true;
+    }
   }
 }
